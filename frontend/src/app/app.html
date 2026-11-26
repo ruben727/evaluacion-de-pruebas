@@ -1,0 +1,16 @@
+<header class="topbar">
+  <a class="brand" routerLink="/" data-testid="brand">Gestión de usuarios</a>
+
+  @if (auth.isAuthenticated()) {
+    <nav class="topbar-actions">
+      <span class="current-user" data-testid="current-user">{{ auth.currentUser()?.name }}</span>
+      <button type="button" class="btn btn-ghost" data-testid="logout-button" (click)="logout()">
+        Cerrar sesión
+      </button>
+    </nav>
+  }
+</header>
+
+<main class="container">
+  <router-outlet />
+</main>

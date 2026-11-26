@@ -1,0 +1,162 @@
+<section class="card">
+  <div class="page-header">
+    <h1>Usuarios</h1>
+    <button type="button" class="btn" data-testid="new-user-button" (click)="openCreate()">+ Nuevo usuario</button>
+  </div>
+
+  @if (message(); as msg) {
+    <div
+      class="alert"
+      [class.alert-success]="msg.type === 'success'"
+      [class.alert-error]="msg.type === 'error'"
+      [attr.data-testid]="msg.type === 'success' ? 'alert-success' : 'alert-error'"
+      role="status"
+    >
+      {{ msg.text }}
+    </div>
+  }
+
+  @if (loading()) {
+    <p class="muted" data-testid="users-loading">Cargando usuarios...</p>
+  } @else if (users().length === 0) {
+    <p class="muted" data-testid="users-empty">No hay usuarios registrados.</p>
+  } @else {
+    <div class="table-wrapper">
+      <table class="table" data-testid="users-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Nombre</th>
+            <th>Correo</th>
+            <th>Creado</th>
+            <th class="actions-col">Acciones</th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (user of users(); track user.id) {
+            <tr data-testid="user-row" [attr.data-email]="user.email">
+              <td>{{ user.id }}</td>
+              <td data-testid="user-name">{{ user.name }}</td>
+              <td data-testid="user-email">{{ user.email }}</td>
+              <td>{{ user.createdAt | date: 'short' }}</td>
+              <td class="actions-col">
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                  data-testid="edit-user-button"
+                  (click)="openEdit(user)"
+                >
+                  Editar
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-danger btn-sm"
+                  data-testid="delete-user-button"
+                  (click)="askDelete(user)"
+                >
+                  Eliminar
+                </button>
+              </td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
+  }
+</section>
+
+<!-- Formulario de alta / edición -->
+@if (formMode(); as mode) {
+  <div class="backdrop" (click)="closeForm()"></div>
+  <div class="dialog card" role="dialog" aria-modal="true" aria-labelledby="user-form-title" data-testid="user-form-dialog">
+    <h2 id="user-form-title">{{ mode.kind === 'create' ? 'Nuevo usuario' : 'Editar usuario' }}</h2>
+
+    @if (formError()) {
+      <div class="alert alert-error" data-testid="user-form-error" role="alert">{{ formError() }}</div>
+    }
+
+    <form [formGroup]="form" (ngSubmit)="save()" novalidate data-testid="user-form">
+      <div class="form-field">
+        <label for="user-name">Nombre</label>
+        <input
+          id="user-name"
+          type="text"
+          formControlName="name"
+          data-testid="user-name-input"
+          [class.invalid]="invalid('name')"
+        />
+        @if (invalid('name')) {
+          <span class="field-error">El nombre debe tener al menos 2 caracteres</span>
+        }
+      </div>
+
+      <div class="form-field">
+        <label for="user-email">Correo</label>
+        <input
+          id="user-email"
+          type="email"
+          formControlName="email"
+          data-testid="user-email-input"
+          [class.invalid]="invalid('email')"
+        />
+        @if (invalid('email')) {
+          <span class="field-error">Ingresa un correo válido</span>
+        }
+      </div>
+
+      <div class="form-field">
+        <label for="user-password">
+          Contraseña
+          @if (mode.kind === 'edit') {
+            <span class="muted">(dejar vacío para no cambiarla)</span>
+          }
+        </label>
+        <input
+          id="user-password"
+          type="password"
+          formControlName="password"
+          autocomplete="new-password"
+          data-testid="user-password-input"
+          [class.invalid]="invalid('password')"
+        />
+        @if (invalid('password')) {
+          <span class="field-error">Mínimo 6 caracteres</span>
+        }
+      </div>
+
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" data-testid="user-form-cancel" (click)="closeForm()">
+          Cancelar
+        </button>
+        <button type="submit" class="btn" data-testid="user-form-submit" [disabled]="saving()">
+          {{ saving() ? 'Guardando...' : 'Guardar' }}
+        </button>
+      </div>
+    </form>
+  </div>
+}
+
+<!-- Confirmación de borrado -->
+@if (pendingDelete(); as user) {
+  <div class="backdrop" (click)="cancelDelete()"></div>
+  <div class="dialog card" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" data-testid="confirm-dialog">
+    <h2 id="confirm-title">¿Eliminar usuario?</h2>
+    <p>
+      Se eliminará a <strong>{{ user.name }}</strong> ({{ user.email }}). Esta acción no se puede deshacer.
+    </p>
+    <div class="dialog-actions">
+      <button type="button" class="btn btn-ghost" data-testid="cancel-delete-button" (click)="cancelDelete()">
+        Cancelar
+      </button>
+      <button
+        type="button"
+        class="btn btn-danger"
+        data-testid="confirm-delete-button"
+        [disabled]="saving()"
+        (click)="confirmDelete()"
+      >
+        Eliminar
+      </button>
+    </div>
+  </div>
+}

@@ -1,0 +1,18 @@
+{
+  "name": "pruebas-final",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sistema web (Angular + Express + PostgreSQL) con pruebas automatizadas y observabilidad OpenTelemetry",
+  "scripts": {
+    "install:all": "npm ci --prefix backend && npm ci --prefix frontend && npm ci --prefix e2e && npm run install:browsers --prefix e2e",
+    "up": "docker compose up -d --build",
+    "down": "docker compose down",
+    "logs": "docker compose logs -f backend",
+    "db:up": "docker compose up -d db",
+    "test:backend": "npm test --prefix backend",
+    "test:frontend": "npm test --prefix frontend",
+    "test:unit": "npm run test:backend && npm run test:frontend",
+    "test:e2e": "npm run test:e2e --prefix e2e",
+    "test": "npm run test:unit && npm run test:e2e"
+  }
+}
