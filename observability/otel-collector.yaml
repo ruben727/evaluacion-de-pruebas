@@ -1,0 +1,112 @@
+# OpenTelemetry Collector (contrib 0.166) — métricas de infraestructura del host → OpenObserve (OTLP HTTP).
+# Nota: desde la 0.16x los componentes usan nombres snake_case (host_metrics, otlp_http, basic_auth...).
+
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+  basic_auth/openobserve:
+    client_auth:
+      username: ${env:ZO_ROOT_USER_EMAIL}
+      password: ${env:ZO_ROOT_USER_PASSWORD}
+
+receivers:
+  host_metrics:
+    collection_interval: ${env:HOSTMETRICS_INTERVAL:-30s}
+    # El sistema de archivos del host está montado en /hostfs (ver docker-compose.yml)
+    root_path: /hostfs
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      load: {}
+      paging: {}            # swap (la t3.small tiene 2 GB de swap)
+      network:
+        exclude:
+          interfaces: ["^lo$", "^veth.*", "^docker.*", "^br-.*"]
+          match_type: regexp
+      disk:
+        exclude:
+          devices: ["^loop.*", "^ram.*"]
+          match_type: regexp
+      filesystem:
+        metrics:
+          system.filesystem.utilization:
+            enabled: true
+        exclude_fs_types:
+          fs_types:
+            - autofs
+            - binfmt_misc
+            - bpf
+            - cgroup
+            - cgroup2
+            - configfs
+            - debugfs
+            - devpts
+            - devtmpfs
+            - fusectl
+            - hugetlbfs
+            - iso9660
+            - mqueue
+            - nsfs
+            - overlay
+            - proc
+            - procfs
+            - pstore
+            - rpc_pipefs
+            - securityfs
+            - selinuxfs
+            - squashfs
+            - sysfs
+            - tmpfs
+            - tracefs
+          match_type: strict
+        exclude_mount_points:
+          mount_points: ["^/dev/.*", "^/proc/.*", "^/sys/.*", "^/run/.*", "^/var/lib/docker/.*", "^/snap/.*"]
+          match_type: regexp
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 150
+    spike_limit_mib: 30
+  # host.name, os.type y, en EC2, cloud.region / host.id / host.type (vía IMDS)
+  resource_detection:
+    detectors: [env, system, ec2]
+    timeout: 3s
+    override: false
+    system:
+      hostname_sources: [os]
+  resource:
+    attributes:
+      - key: service.name
+        value: ec2-host
+        action: upsert
+  batch:
+    send_batch_size: 1024
+    timeout: 10s
+
+exporters:
+  otlp_http/openobserve:
+    endpoint: ${env:OO_OTLP_ENDPOINT}
+    auth:
+      authenticator: basic_auth/openobserve
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 5m
+
+service:
+  extensions: [health_check, basic_auth/openobserve]
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    metrics:
+      receivers: [host_metrics]
+      processors: [memory_limiter, resource_detection, resource, batch]
+      exporters: [otlp_http/openobserve]

@@ -11,8 +11,16 @@
  *   OTEL_EXPORTER_OTLP_ENDPOINT  p.ej. https://api.openobserve.ai/api/<organizacion>
  *   OTEL_EXPORTER_OTLP_HEADERS   p.ej. Authorization=Basic%20<base64(usuario:contraseña)>
  *   OTEL_SERVICE_NAME            nombre del servicio en OpenObserve
+ *
+ * Alternativa a OTEL_EXPORTER_OTLP_HEADERS: definir OPENOBSERVE_USER y OPENOBSERVE_PASSWORD
+ * y la cabecera "Authorization: Basic ..." se construye aquí (sin calcular base64 a mano).
  */
 const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+
+if (!process.env.OTEL_EXPORTER_OTLP_HEADERS && process.env.OPENOBSERVE_USER && process.env.OPENOBSERVE_PASSWORD) {
+  const basic = Buffer.from(`${process.env.OPENOBSERVE_USER}:${process.env.OPENOBSERVE_PASSWORD}`).toString('base64');
+  process.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=${encodeURIComponent(`Basic ${basic}`)}`;
+}
 const disabled = String(process.env.OTEL_SDK_DISABLED).toLowerCase() === 'true';
 
 function bootLog(msg, extra = {}) {

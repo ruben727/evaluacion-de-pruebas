@@ -18,9 +18,21 @@ con Docker en AWS EC2.
 
 ```
 .
-├── docker-compose.yml        # db, backend, frontend (+ openobserve opcional)
-├── .env.example              # plantilla de variables (copiar a .env)
+├── docker-compose.yml        # db, backend, frontend (+ perfil "observability": openobserve, otel-collector, thermal-probe)
+├── .env.example              # variables para desarrollo/CI (copiar a .env)
+├── .env.production.example   # variables para la EC2
 ├── package.json              # scripts de conveniencia para todo el proyecto
+├── .github/
+│   ├── workflows/ci-cd.yml   # pipeline: test → notify-tests / deploy → notify-deploy
+│   └── scripts/notify-openobserve.sh
+├── observability/
+│   ├── otel-collector.yaml   # métricas del host (CPU, RAM, red, disco, carga, filesystem, swap)
+│   ├── thermal-probe.sh      # sonda de temperatura
+│   └── dashboards/           # dashboards importables (JSON) + generador/validador + alertas
+├── scripts/prepare-production-env.sh   # arma el .env de producción en la EC2
+├── docs/
+│   ├── OPENOBSERVE.md        # dashboards y alertas paso a paso
+│   └── DEMO.md               # guion de la demostración
 ├── backend/
 │   ├── Dockerfile
 │   ├── src/
@@ -250,13 +262,185 @@ Todas están en `.env.example`. **El `.env` real nunca se sube** (está en `.git
 
 Variables solo de pruebas: `TEST_DATABASE_URL` (backend), `TEST_LOG_LEVEL` (backend), `E2E_BASE_URL` (Playwright).
 
+Variables añadidas para producción (ver `.env.production.example`):
+
+| Variable | Por defecto | Descripción |
+|----------|-------------|-------------|
+| `COMPOSE_PROFILES` | vacío | `observability` en producción: levanta OpenObserve, Collector y sonda con `docker compose up -d` |
+| `DB_BIND_ADDRESS` | `0.0.0.0` | Interfaz donde se publica Postgres (`127.0.0.1` en producción) |
+| `APP_COMMIT` | `unknown` | Commit con el que se construye la imagen del backend; lo muestra `/api/health` (lo exporta el pipeline) |
+| `ZO_RETENTION_DAYS` | `15` | Retención de datos en OpenObserve |
+| `OPENOBSERVE_MEMORY_LIMIT` | `768M` | Límite de memoria del contenedor de OpenObserve |
+| `ZO_MEMORY_CACHE_MAX_SIZE`, `ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE`, `ZO_MEM_TABLE_MAX_SIZE`, `ZO_MAX_FILE_SIZE_IN_MEMORY` | 128 / 128 / 64 / 32 (MB) | Caches internas de OpenObserve (ajustadas a 2 GB de RAM) |
+| `OO_OTLP_ENDPOINT` | `http://127.0.0.1:5080/api/default` | Destino OTLP del Collector (usa la red del host) |
+| `HOSTMETRICS_INTERVAL` | `30s` | Frecuencia de las métricas del host |
+| `THERMAL_PROBE_INTERVAL` | `60` | Frecuencia de la sonda de temperatura (s) |
+
+Si `OTEL_EXPORTER_OTLP_HEADERS` está vacío y existen `ZO_ROOT_USER_EMAIL`/`ZO_ROOT_USER_PASSWORD`,
+el backend construye él mismo la cabecera `Authorization: Basic ...` (no hace falta calcular base64).
+
 ---
 
-## Despliegue en AWS EC2 (resumen)
+## CI/CD con GitHub Actions
 
-1. Instancia con Docker y el plugin de Compose; abre el puerto `FRONTEND_PORT` (o 80) en el Security Group.
-   No hace falta exponer 5433 públicamente.
-2. Clona el repositorio, crea el `.env` con secretos reales y ejecuta `docker compose up -d --build`.
-3. Verifica con `curl http://<ip-publica>:8080/api/health` y corre los E2E con `E2E_BASE_URL=http://<ip-publica>:8080`.
+Workflow: `.github/workflows/ci-cd.yml`. Se ejecuta en **push** y **pull_request** a `main`.
 
-> El workflow de GitHub Actions se agregará en una segunda etapa.
+```
+              ┌──────────────► notify-tests   (siempre) → OpenObserve: evento "test"
+  test ───────┤
+ (backend,    └──► deploy ───► notify-deploy  (siempre en push a main) → OpenObserve: evento "deploy"
+  frontend,       (solo push a main
+  E2E)             y si test = success)
+```
+
+| Job | Qué hace |
+|-----|----------|
+| `test` | Postgres 16 como *service* (`TEST_DATABASE_URL`) → Jest + Supertest → pruebas unitarias de Angular → `docker compose up --build --wait` dentro del runner → Playwright. Sube `playwright-report` (reporte HTML, capturas, videos y trazas de los fallos) como artifact. |
+| `notify-tests` | `if: always()`. Envía a `http://<EC2>:5080/api/default/cicd_pipeline/_json` (auth básica): `type=test`, `result`, `commit`, `commit_message`, `branch`, `actor`, `run_id`, `run_url`, `timestamp` y el resultado de cada suite. |
+| `deploy` | Solo en push a `main` y si `test` pasó; si no, queda *skipped* y **no se abre ninguna conexión SSH**. Por SSH (`appleboy/ssh-action`): `git pull`, fija el commit probado, `docker compose up -d --build`, espera a que `/api/health` responda `ok` **con ese commit** y limpia imágenes viejas. Después vuelve a verificar `/api/health` desde Internet. Despliegues serializados (`concurrency`). |
+| `notify-deploy` | `if: always()` en push a `main`. Envía `type=deploy` con `success`, `failure` o `skipped` (no se desplegó porque fallaron las pruebas). |
+
+Los datos sensibles vienen de *secrets*; el mensaje del commit se pasa por variable de entorno
+(nunca interpolado en el script) para evitar inyección de comandos. Las notificaciones usan
+`continue-on-error`: si OpenObserve no responde, el pipeline no falla (queda un aviso).
+
+Validación de la sintaxis: `npm run lint:workflow` (actionlint + shellcheck).
+
+### GitHub Secrets
+
+En GitHub: **Settings → Secrets and variables → Actions → New repository secret**.
+
+| Secret | Valor |
+|--------|-------|
+| `EC2_HOST` | `3.145.142.235` (IP pública de la EC2; se usa para SSH, para `/api/health` y para OpenObserve en el puerto 5080) |
+| `EC2_USER` | `ubuntu` |
+| `EC2_SSH_KEY` | Contenido **completo** de la llave privada `.pem` con la que entras a la EC2, incluidas las líneas `-----BEGIN ... KEY-----` y `-----END ... KEY-----` |
+| `OPENOBSERVE_USER` | El correo de `ZO_ROOT_USER_EMAIL` del `.env` del servidor |
+| `OPENOBSERVE_PASSWORD` | La contraseña de `ZO_ROOT_USER_PASSWORD` del `.env` del servidor |
+
+Requisitos en AWS: el Security Group debe permitir **22** (SSH) desde los runners de GitHub
+(sus IPs cambian, así que en la práctica `0.0.0.0/0` con autenticación solo por llave), **8080** (app)
+y **5080** (OpenObserve). El repositorio en la EC2 debe poder hacer `git pull` sin pedir credenciales
+(repo público o *deploy key*).
+
+> Opcional: en **Settings → Environments → production** puedes exigir aprobación manual antes de cada despliegue.
+
+---
+
+## Producción en EC2
+
+En la EC2 todo corre con `docker compose` y `restart: unless-stopped` (vuelve solo tras un reinicio):
+
+| Servicio | Memoria máx. | Función |
+|----------|--------------|---------|
+| `db` | 384 MB | PostgreSQL 16 (puerto solo en `127.0.0.1`) |
+| `backend` | 384 MB | API; telemetría → `http://openobserve:5080` por la red interna de Docker |
+| `frontend` | 64 MB | nginx en el puerto 8080 |
+| `openobserve` | 768 MB | OpenObserve v1.2.0, volumen `openobserve_data`, caches limitadas, retención 15 días |
+| `otel-collector` | 192 MB | Métricas del host → OpenObserve |
+| `thermal-probe` | 32 MB | Sonda de temperatura |
+
+Los logs de Docker rotan (3 × 10 MB por contenedor) para no llenar el disco.
+
+### Comandos para el servidor (una sola vez)
+
+Orden recomendado: 1) crea los secrets en GitHub, 2) haz push (el pipeline desplegará el código
+nuevo aunque OpenObserve aún no esté arriba), 3) en la EC2:
+
+```bash
+ssh -i /ruta/a/tu-llave.pem ubuntu@3.145.142.235
+cd /home/ubuntu/evaluacion-de-pruebas
+git pull origin main
+
+# Arma el .env de producción: respalda el actual, CONSERVA la contraseña de Postgres,
+# JWT_SECRET y datos del admin, y agrega OpenObserve/OTel/Collector.
+# Usa el mismo correo y contraseña que pusiste en los secrets OPENOBSERVE_USER / OPENOBSERVE_PASSWORD.
+OO_EMAIL='tu-correo@ejemplo.com' OO_PASSWORD='la-misma-clave-del-secret' bash scripts/prepare-production-env.sh
+
+# Revisa el resultado (no debe quedar ningún "CAMBIAR")
+nano .env
+
+# Levanta todo: app + OpenObserve + Collector + sonda (COMPOSE_PROFILES=observability en .env)
+export APP_COMMIT="$(git rev-parse HEAD)"
+docker compose up -d --build --remove-orphans
+
+# Comprobaciones
+docker compose ps
+curl -s http://localhost:8080/api/health
+curl -s http://localhost:5080/healthz
+docker stats --no-stream
+docker compose logs --tail 20 otel-collector thermal-probe
+```
+
+> - Si OpenObserve **ya estaba corriendo** en el servidor, su usuario admin ya existe: usa en
+>   `OO_EMAIL`/`OO_PASSWORD` (y en los secrets) las credenciales con las que ya entras. Cambiar las
+>   variables `ZO_ROOT_USER_*` no cambia una contraseña ya creada.
+> - Evita el carácter `$` en las contraseñas del `.env` (docker compose lo interpreta); si lo usas, escríbelo `$$`.
+> - A partir de aquí cada push a `main` que pase las pruebas se despliega solo.
+
+Después importa los dashboards y crea las alertas: [docs/OPENOBSERVE.md](docs/OPENOBSERVE.md).
+
+---
+
+## Monitoreo del servidor (infraestructura)
+
+El servicio `otel-collector` (`otel/opentelemetry-collector-contrib:0.166.0`, config en
+`observability/otel-collector.yaml`) usa el receiver **host_metrics** leyendo el sistema del host
+montado en solo lectura (`/proc`, `/sys` y `/` en `/hostfs`) y exporta por **OTLP HTTP** a OpenObserve:
+
+| Scraper | Métricas en OpenObserve |
+|---------|-------------------------|
+| cpu | `system_cpu_utilization` (por estado: user, system, iowait, **steal**...), `system_cpu_time` |
+| memory | `system_memory_utilization`, `system_memory_usage` |
+| load | `system_cpu_load_average_1m/5m/15m` |
+| network | `system_network_io` (bytes por dirección), paquetes, errores, conexiones |
+| disk | `system_disk_io`, `system_disk_operations`, tiempos |
+| filesystem | `system_filesystem_utilization`, `system_filesystem_usage` |
+| paging | `system_paging_usage` (swap) |
+
+Usa `network_mode: host`: desde la red de Docker solo vería la interfaz virtual del contenedor y no
+el tráfico real de la EC2. Con `resource_detection` (detector `ec2`) añade región, tipo e id de instancia.
+
+### Temperatura
+
+**Qué se intentó:** el servicio `thermal-probe` (`observability/thermal-probe.sh`) lee cada 60 s las
+dos fuentes estándar de Linux, `/sys/class/thermal/thermal_zone*/temp` y
+`/sys/class/hwmon/hwmon*/temp*_input`. Si encuentra sensores, envía cada lectura en °C al stream
+`host_temperature` de OpenObserve (verificado con un `/sys` simulado).
+
+**Por qué en EC2 normalmente no hay datos:** una t3.small es una máquina virtual sobre el hipervisor
+**AWS Nitro**. El kernel invitado ve CPUs y dispositivos *virtuales*: el hipervisor no le expone zonas
+térmicas ACPI ni chips de sensores (hwmon), y drivers como `coretemp` no funcionan porque necesitan leer
+registros MSR de la CPU física, que el hipervisor no virtualiza. AWS tampoco publica la temperatura del
+hardware en CloudWatch: la salud física la gestiona AWS (status checks del sistema) y, si hay un
+problema de hardware, migra o retira la instancia.
+
+**Qué se hace en ese caso (alternativa usada):**
+
+1. La sonda registra cada hora un evento `sensor_available=false` con el número de zonas térmicas y
+   dispositivos hwmon encontrados (0) y el motivo. Así queda **evidencia en OpenObserve** de que se
+   intentó medir y por qué no hay datos (tabla *Temperatura* del dashboard del servidor).
+2. Como indicadores de "estrés térmico/carga" se usan las métricas que sí existen: **uso de CPU**,
+   **load average** y sobre todo **CPU steal**: en instancias t3 (burstable) el límite real no es la
+   temperatura sino los **créditos de CPU**; cuando se agotan, AWS limita la CPU y el `steal` sube.
+3. Complemento opcional en CloudWatch: `CPUCreditBalance` y `StatusCheckFailed_System`.
+
+Para comprobarlo a mano en la EC2:
+
+```bash
+ls /sys/class/thermal/ /sys/class/hwmon/ 2>&1
+cat /sys/class/thermal/thermal_zone*/temp 2>&1
+docker compose logs thermal-probe
+```
+
+---
+
+## Despliegue manual (sin pipeline)
+
+```bash
+cd /home/ubuntu/evaluacion-de-pruebas && git pull origin main
+export APP_COMMIT="$(git rev-parse HEAD)" && docker compose up -d --build
+curl -s http://localhost:8080/api/health
+```
+
+Las pruebas E2E se pueden correr contra la EC2 con `E2E_BASE_URL=http://3.145.142.235:8080 npm run test:e2e --prefix e2e`.

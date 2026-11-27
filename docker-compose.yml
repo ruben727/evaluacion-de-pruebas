@@ -1,16 +1,25 @@
 name: pruebas-final
 
+# Rotación de logs de Docker: evita que los logs llenen el disco de la EC2
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
       POSTGRES_DB: ${POSTGRES_DB:-app}
     ports:
-      # Publicado en el host para poder correr las pruebas del backend localmente
-      - "${DB_HOST_PORT:-5433}:5432"
+      # Publicado en el host para correr las pruebas del backend desde la máquina local.
+      # En producción DB_BIND_ADDRESS=127.0.0.1 para que NO sea accesible desde Internet.
+      - "${DB_BIND_ADDRESS:-0.0.0.0}:${DB_HOST_PORT:-5433}:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,11 +28,19 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
 
   backend:
     build:
       context: ./backend
+      args:
+        # Commit desplegado; lo exporta el pipeline (ver .github/workflows/ci-cd.yml)
+        APP_COMMIT: ${APP_COMMIT:-unknown}
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       db:
         condition: service_healthy
@@ -43,10 +60,14 @@ services:
       ADMIN_NAME: ${ADMIN_NAME:-Administrador}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Telemetría: vacío = desactivada. En producción apunta a http://openobserve:5080/api/default
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-pruebas-final-backend}
       OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-15000}
+      # Si OTEL_EXPORTER_OTLP_HEADERS está vacío, la cabecera Basic se arma con estas credenciales
+      OPENOBSERVE_USER: ${ZO_ROOT_USER_EMAIL:-}
+      OPENOBSERVE_PASSWORD: ${ZO_ROOT_USER_PASSWORD:-}
     expose:
       - "3000"
     healthcheck:
@@ -55,32 +76,113 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
 
   frontend:
     build:
       context: ./frontend
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       backend:
         condition: service_healthy
     ports:
       - "${FRONTEND_PORT:-8080}:80"
+    deploy:
+      resources:
+        limits:
+          memory: 64M
 
-  # OpenObserve local (opcional) para probar la telemetría sin la nube:
+  # ---------------------------------------------------------------------------
+  # Observabilidad (perfil "observability"). Se activa con:
   #   docker compose --profile observability up -d
-  # y en .env: OTEL_EXPORTER_OTLP_ENDPOINT=http://openobserve:5080/api/default
+  # o, en producción, con COMPOSE_PROFILES=observability en el .env
+  # ---------------------------------------------------------------------------
+
+  # OpenObserve: logs, métricas y trazas. Configurado para una t3.small (2 GB RAM).
   openobserve:
-    image: public.ecr.aws/zinclabs/openobserve:latest
+    image: public.ecr.aws/zinclabs/openobserve:v1.2.0
     profiles: ["observability"]
     restart: unless-stopped
+    logging: *default-logging
     environment:
       ZO_ROOT_USER_EMAIL: ${ZO_ROOT_USER_EMAIL:-root@example.com}
       ZO_ROOT_USER_PASSWORD: ${ZO_ROOT_USER_PASSWORD:-Complexpass#123}
       ZO_DATA_DIR: /data
+      ZO_TELEMETRY: "false"
+      # Límites de memoria internos (MB) para que quepa junto a la app en 2 GB
+      ZO_MEMORY_CACHE_MAX_SIZE: ${ZO_MEMORY_CACHE_MAX_SIZE:-128}
+      ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE: ${ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE:-128}
+      ZO_MEM_TABLE_MAX_SIZE: ${ZO_MEM_TABLE_MAX_SIZE:-64}
+      ZO_MAX_FILE_SIZE_IN_MEMORY: ${ZO_MAX_FILE_SIZE_IN_MEMORY:-32}
+      # Retención de datos en disco (días)
+      ZO_COMPACT_DATA_RETENTION_DAYS: ${ZO_RETENTION_DAYS:-15}
     ports:
       - "5080:5080"
     volumes:
       - openobserve_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: ${OPENOBSERVE_MEMORY_LIMIT:-768M}
+
+  # OpenTelemetry Collector: métricas del host (CPU, RAM, red, disco, carga, filesystem, swap).
+  # Usa la red del host para que las métricas de red sean las interfaces REALES de la EC2
+  # (desde la red de Docker solo vería la interfaz virtual del contenedor).
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.166.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging: *default-logging
+    network_mode: host
+    command: ["--config=/etc/otelcol/config.yaml"]
+    depends_on:
+      - openobserve
+    environment:
+      ZO_ROOT_USER_EMAIL: ${ZO_ROOT_USER_EMAIL:-root@example.com}
+      ZO_ROOT_USER_PASSWORD: ${ZO_ROOT_USER_PASSWORD:-Complexpass#123}
+      # Con network_mode: host, OpenObserve se alcanza por su puerto publicado en localhost
+      OO_OTLP_ENDPOINT: ${OO_OTLP_ENDPOINT:-http://127.0.0.1:5080/api/default}
+      HOSTMETRICS_INTERVAL: ${HOSTMETRICS_INTERVAL:-30s}
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+      # Sistema de archivos del host en solo lectura: /proc y /sys (CPU, RAM, red, disco, carga)
+      # y / para medir el uso de los filesystems reales.
+      - /:/hostfs:ro
+      - /proc:/hostfs/proc:ro
+      - /sys:/hostfs/sys:ro
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+
+  # Sonda de temperatura: intenta leer sensores en /sys/class/thermal y /sys/class/hwmon.
+  # En EC2 normalmente no existen (ver README, sección "Temperatura"); en ese caso
+  # registra periódicamente "sensor_available=false" en OpenObserve.
+  thermal-probe:
+    image: curlimages/curl:8.23.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    logging: *default-logging
+    entrypoint: ["/bin/sh", "/probe/thermal-probe.sh"]
+    depends_on:
+      - openobserve
+    environment:
+      ZO_ROOT_USER_EMAIL: ${ZO_ROOT_USER_EMAIL:-root@example.com}
+      ZO_ROOT_USER_PASSWORD: ${ZO_ROOT_USER_PASSWORD:-Complexpass#123}
+      OO_URL: http://openobserve:5080
+      PROBE_INTERVAL: ${THERMAL_PROBE_INTERVAL:-60}
+    volumes:
+      - ./observability/thermal-probe.sh:/probe/thermal-probe.sh:ro
+      - /sys:/hostfs/sys:ro
+      - /etc/hostname:/hostfs/etc/hostname:ro
+    deploy:
+      resources:
+        limits:
+          memory: 32M
 
 volumes:
   db_data:

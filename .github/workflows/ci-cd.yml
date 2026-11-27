@@ -1,0 +1,302 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Un PR nuevo cancela la ejecución anterior del mismo PR; en main nunca se cancela
+# (para no cortar un despliegue a medias).
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "22"
+  # Ruta del repositorio en la EC2 y puerto público de la app (no son datos sensibles)
+  APP_DIR: /home/ubuntu/evaluacion-de-pruebas
+  APP_PORT: "8080"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Pruebas: backend (Jest + Postgres de servicio), frontend (unitarias) y E2E
+  #    (Playwright contra el stack levantado con docker compose dentro del runner)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Pruebas (backend, frontend, E2E)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      backend_tests: ${{ steps.backend.outcome }}
+      frontend_tests: ${{ steps.frontend.outcome }}
+      e2e_tests: ${{ steps.e2e.outcome }}
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d app_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      CI: "true"
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/app_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+            e2e/package-lock.json
+
+      # ---- Backend ----
+      - name: Backend · instalar dependencias
+        working-directory: backend
+        run: npm ci
+
+      - name: Backend · pruebas (Jest + Supertest)
+        id: backend
+        working-directory: backend
+        run: npm test -- --ci
+
+      # ---- Frontend ----
+      - name: Frontend · instalar dependencias
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend · pruebas unitarias
+        id: frontend
+        working-directory: frontend
+        run: npm test
+
+      # ---- E2E ----
+      - name: E2E · instalar Playwright
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: E2E · preparar .env del stack
+        run: |
+          cp .env.example .env
+          sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env
+          sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+
+      - name: E2E · levantar stack con docker compose
+        env:
+          APP_COMMIT: ${{ github.sha }}
+        run: |
+          docker compose up -d --build --wait --wait-timeout 300
+          docker compose ps
+          curl -fsS "http://localhost:${APP_PORT}/api/health"
+
+      - name: E2E · pruebas Playwright
+        id: e2e
+        working-directory: e2e
+        env:
+          E2E_BASE_URL: http://localhost:${{ env.APP_PORT }}
+        run: npm run test:e2e
+
+      - name: Logs del stack (solo si algo falló)
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail 200
+
+      - name: Subir reporte de Playwright
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Apagar stack
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  # ---------------------------------------------------------------------------
+  # 2. Registrar el resultado de las pruebas en OpenObserve (siempre)
+  # ---------------------------------------------------------------------------
+  notify-tests:
+    name: Notificar pruebas a OpenObserve
+    needs: test
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (solo scripts)
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Enviar evento "test"
+        # Si OpenObserve no responde, el pipeline no se marca como fallido (queda un aviso)
+        continue-on-error: true
+        env:
+          OPENOBSERVE_URL: http://${{ secrets.EC2_HOST }}:5080
+          OPENOBSERVE_USER: ${{ secrets.OPENOBSERVE_USER }}
+          OPENOBSERVE_PASSWORD: ${{ secrets.OPENOBSERVE_PASSWORD }}
+          EVENT_TYPE: test
+          RESULT: ${{ needs.test.result }}
+          COMMIT_SHA: ${{ github.sha }}
+          # Por variable de entorno (nunca interpolado en el script) para evitar inyección de comandos
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || github.event.pull_request.title }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW: ${{ github.workflow }}
+          REPOSITORY: ${{ github.repository }}
+          # Resultado de cada suite: {"backend_tests":"success","frontend_tests":"success","e2e_tests":"failure"}
+          EXTRA_FIELDS: ${{ toJSON(needs.test.outputs) }}
+        run: bash .github/scripts/notify-openobserve.sh
+
+  # ---------------------------------------------------------------------------
+  # 3. Despliegue en EC2: solo en push a main y solo si las pruebas pasaron.
+  #    Si "test" falla, este job queda "skipped" y NO se abre ninguna conexión SSH.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Desplegar en EC2
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.test.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: production
+    # Nunca dos despliegues a la vez; uno nuevo espera a que termine el anterior
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Desplegar por SSH (git pull + docker compose up)
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          APP_DIR: ${{ env.APP_DIR }}
+          APP_PORT: ${{ env.APP_PORT }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          envs: DEPLOY_SHA,APP_DIR,APP_PORT
+          command_timeout: 25m
+          script: |
+            set -euo pipefail
+            cd "$APP_DIR"
+            echo ">> Commit actual: $(git rev-parse --short HEAD) -> a desplegar: ${DEPLOY_SHA:0:7}"
+
+            git fetch --prune origin
+            git checkout -q main
+            git pull --ff-only origin main
+            # Desplegar EXACTAMENTE el commit que pasó las pruebas, aunque main ya tenga commits
+            # más nuevos (esos se desplegarán cuando terminen sus propias pruebas).
+            git reset --hard "$DEPLOY_SHA"
+
+            export APP_COMMIT="$DEPLOY_SHA"
+            echo ">> docker compose up -d --build"
+            docker compose up -d --build --remove-orphans
+
+            echo ">> Verificando http://localhost:${APP_PORT}/api/health"
+            for i in $(seq 1 36); do
+              if body="$(curl -fsS --max-time 5 "http://localhost:${APP_PORT}/api/health")" \
+                 && echo "$body" | grep -q '"status":"ok"' \
+                 && echo "$body" | grep -q "\"commit\":\"${DEPLOY_SHA}\""; then
+                echo ">> OK: $body"
+                break
+              fi
+              if [ "$i" -eq 36 ]; then
+                echo ">> ERROR: la app no quedó sana tras 3 minutos"
+                docker compose ps -a
+                docker compose logs --no-color --tail 100 backend frontend
+                exit 1
+              fi
+              sleep 5
+            done
+
+            # Limpieza para no llenar el disco de la EC2
+            docker image prune -f
+            docker builder prune -f --filter until=168h
+            docker compose ps
+
+      - name: Verificar /api/health desde Internet
+        env:
+          HEALTH_URL: http://${{ secrets.EC2_HOST }}:${{ env.APP_PORT }}/api/health
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          for i in $(seq 1 12); do
+            body="$(curl -fsS --max-time 10 "$HEALTH_URL" || true)"
+            status="$(jq -r '.status // empty' <<<"$body" 2>/dev/null || true)"
+            commit="$(jq -r '.api.commit // empty' <<<"$body" 2>/dev/null || true)"
+            if [[ "$status" == "ok" && "$commit" == "$EXPECTED_COMMIT" ]]; then
+              echo "Despliegue verificado: status=$status commit=$commit"
+              jq . <<<"$body"
+              exit 0
+            fi
+            echo "Intento $i: status='${status}' commit='${commit}'"
+            sleep 5
+          done
+          echo "::error::/api/health no confirma el commit ${EXPECTED_COMMIT}"
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # 4. Registrar el resultado del despliegue en OpenObserve (siempre en push a main,
+  #    incluso cuando el deploy quedó "skipped" porque fallaron las pruebas)
+  # ---------------------------------------------------------------------------
+  notify-deploy:
+    name: Notificar despliegue a OpenObserve
+    needs: [test, deploy]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (solo scripts)
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Enviar evento "deploy"
+        continue-on-error: true
+        env:
+          OPENOBSERVE_URL: http://${{ secrets.EC2_HOST }}:5080
+          OPENOBSERVE_USER: ${{ secrets.OPENOBSERVE_USER }}
+          OPENOBSERVE_PASSWORD: ${{ secrets.OPENOBSERVE_PASSWORD }}
+          EVENT_TYPE: deploy
+          RESULT: ${{ needs.deploy.result }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW: ${{ github.workflow }}
+          REPOSITORY: ${{ github.repository }}
+          EXTRA_FIELDS: '{"environment":"production","tests_result":"${{ needs.test.result }}"}'
+        run: bash .github/scripts/notify-openobserve.sh

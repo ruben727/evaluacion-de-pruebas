@@ -1,0 +1,6 @@
+# Scripts y configs que se ejecutan/montan en contenedores Linux: siempre LF
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+*.conf text eol=lf

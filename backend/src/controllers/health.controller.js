@@ -20,7 +20,13 @@ async function health(_req, res) {
   const ok = database.status === 'up';
   res.status(ok ? 200 : 503).json({
     status: ok ? 'ok' : 'degraded',
-    api: { status: 'up', version: pkg.version, uptimeSeconds: Math.round(process.uptime()) },
+    api: {
+      status: 'up',
+      version: pkg.version,
+      // Commit con el que se construyó la imagen (lo usa el pipeline para verificar el despliegue)
+      commit: process.env.APP_COMMIT || 'unknown',
+      uptimeSeconds: Math.round(process.uptime()),
+    },
     database,
     timestamp: new Date().toISOString(),
   });

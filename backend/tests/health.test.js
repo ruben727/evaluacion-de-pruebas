@@ -15,6 +15,14 @@ describe('GET /api/health', () => {
       database: { status: 'up' },
     });
     expect(res.body.database.latencyMs).toEqual(expect.any(Number));
+    expect(res.body.api.commit).toEqual(expect.any(String));
+  });
+
+  it('expone el commit desplegado (APP_COMMIT)', async () => {
+    process.env.APP_COMMIT = 'abc123';
+    const res = await request(app).get('/api/health');
+    delete process.env.APP_COMMIT;
+    expect(res.body.api.commit).toBe('abc123');
   });
 
   it('responde 503 si la BD no responde', async () => {

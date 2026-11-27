@@ -13,6 +13,10 @@
     "test:frontend": "npm test --prefix frontend",
     "test:unit": "npm run test:backend && npm run test:frontend",
     "test:e2e": "npm run test:e2e --prefix e2e",
-    "test": "npm run test:unit && npm run test:e2e"
+    "test": "npm run test:unit && npm run test:e2e",
+    "up:prod": "docker compose --profile observability up -d --build",
+    "dashboards": "node observability/dashboards/generate-dashboards.js",
+    "dashboards:validate": "node observability/dashboards/generate-dashboards.js --validate",
+    "lint:workflow": "docker run --rm -v \"$PWD:/repo\" -w /repo rhysd/actionlint:latest"
   }
 }
